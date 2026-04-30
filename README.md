@@ -21,14 +21,15 @@ ST-TAF Net is a unified deep learning framework for aerial video analytics that 
 ## File Structure
 
 ```
-ST/
-├── st_taf_net.py        # Neural network model (WSE-AVT Backbone + Anchor-Free Head)
-├── loss.py              # Joint multi-task loss (Focal Loss + Cross Entropy + L1)
-├── mod20_dataset.py     # Video dataset loader (uses decord for fast loading)
-├── train.py             # Main training script — EDIT DATA_ROOT HERE
-├── test_forward.py      # Architecture sanity check (no dataset needed)
-├── requirements.txt     # Python dependencies
-└── README.md            # This file
+st-taf-net/
+├── st_taf_net.py      # Neural network model (WSE-AVT Backbone + Anchor-Free Head)
+├── loss.py            # Joint multi-task loss (Focal Loss + Cross Entropy + L1)
+├── mod20_dataset.py   # Video dataset loader (uses decord for fast loading) 
+├── train.py           # Main training script — EDIT DATA_ROOT HERE
+├── test_forward.py    # Architecture sanity check (no dataset needed)
+├── requirements.txt   # Python dependencies
+├── README.md          # This file
+└── assets/
 ```
 
 ---
