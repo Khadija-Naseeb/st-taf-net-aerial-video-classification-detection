@@ -1,0 +1,201 @@
+"""
+Run the full ablation study for ST-TAF Net (Table 2 in the paper).
+
+Six configurations:
+
+  1. Full ST-TAF Net
+  2. Without SE module
+  3. Cls-only (joint-training disabled, classification head only)
+  4. Det-only (joint-training disabled, detection head only)
+  5. Without offset branch
+  6. Fixed loss weights (lambda_cls = lambda_det = 1, no uncertainty
+     weighting). Compared against the full run, which uses learnable
+     uncertainty weights (Kendall et al., 2018) by default.
+
+Each configuration is trained from scratch by calling train_model()
+from train.py. Results are aggregated into a printable table and a
+JSON file at <output_dir>/ablation_results.json.
+
+Usage:
+    python run_ablation.py --data-root /path/to/dataset --epochs 40
+
+To run a quick smoke test instead of the full 40-epoch schedule:
+    python run_ablation.py --data-root /path/to/dataset --epochs 2
+"""
+
+import os
+import json
+import argparse
+import copy
+
+from train import train_model, DEFAULT_CONFIG
+
+
+# ---------------------------------------------------------------------- #
+ABLATION_CONFIGS = [
+    {
+        'run_name': 'full_sttaf_net',
+        'label':    'Full ST-TAF Net',
+        'overrides': {
+            'use_se':           True,
+            'use_offset':       True,
+            'task_mode':        'joint',
+            'adaptive_weights': True,
+        },
+    },
+    {
+        'run_name': 'without_se',
+        'label':    'Without SE module',
+        'overrides': {
+            'use_se':           False,
+            'use_offset':       True,
+            'task_mode':        'joint',
+            'adaptive_weights': True,
+        },
+    },
+    {
+        'run_name': 'cls_only',
+        'label':    'Without joint training (cls only)',
+        'overrides': {
+            'use_se':           True,
+            'use_offset':       True,
+            'task_mode':        'cls_only',
+            'adaptive_weights': False,   # only one task -> no need
+        },
+    },
+    {
+        'run_name': 'det_only',
+        'label':    'Without joint training (det only)',
+        'overrides': {
+            'use_se':           True,
+            'use_offset':       True,
+            'task_mode':        'det_only',
+            'adaptive_weights': False,
+        },
+    },
+    {
+        'run_name': 'without_offset',
+        'label':    'Without offset branch',
+        'overrides': {
+            'use_se':           True,
+            'use_offset':       False,
+            'task_mode':        'joint',
+            'adaptive_weights': True,
+        },
+    },
+    {
+        'run_name': 'fixed_weights',
+        'label':    'Fixed loss weights (lam1=lam2=1)',
+        'overrides': {
+            'use_se':           True,
+            'use_offset':       True,
+            'task_mode':        'joint',
+            'adaptive_weights': False,
+            'lambda_cls':       1.0,
+            'lambda_det':       1.0,
+        },
+    },
+]
+
+
+# ---------------------------------------------------------------------- #
+def _fmt(x, pct=False):
+    if x is None:
+        return '   --   '
+    if pct:
+        return f"{100 * x:6.2f}%"
+    return f"{x:7.3f}"
+
+
+def print_table(rows):
+    headers = ['Configuration', 'Cls Acc', 'mAP@0.5', 'FPS']
+    widths  = [40, 10, 10, 8]
+    sep     = '+'.join('-' * (w + 2) for w in widths)
+    print()
+    print(sep)
+    print('| ' + ' | '.join(h.ljust(w) for h, w in zip(headers, widths)) + ' |')
+    print(sep)
+    for r in rows:
+        line = ('| '
+                + r['label'].ljust(widths[0])
+                + ' | ' + _fmt(r.get('cls_acc'), pct=True).ljust(widths[1])
+                + ' | ' + _fmt(r.get('mAP'),     pct=False).ljust(widths[2])
+                + ' | ' + _fmt(r.get('fps'),     pct=False).ljust(widths[3])
+                + ' |')
+        print(line)
+    print(sep)
+
+
+# ---------------------------------------------------------------------- #
+def run_ablation(base_cfg, configs, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    rows = []
+
+    for spec in configs:
+        cfg = copy.deepcopy(base_cfg)
+        cfg.update(spec['overrides'])
+        cfg['run_name']   = spec['run_name']
+        cfg['output_dir'] = output_dir
+
+        print('\n' + '#' * 60)
+        print(f"# Ablation row: {spec['label']}")
+        print('#' * 60)
+
+        try:
+            metrics = train_model(cfg) or {}
+        except Exception as e:
+            print(f"[ERROR] run '{spec['run_name']}' failed: {e}")
+            metrics = {}
+
+        rows.append({
+            'run_name': spec['run_name'],
+            'label':    spec['label'],
+            'cls_acc':  metrics.get('cls_acc'),
+            'mAP':      metrics.get('mAP'),
+            'fps':      metrics.get('fps'),
+        })
+
+    out_file = os.path.join(output_dir, 'ablation_results.json')
+    with open(out_file, 'w') as f:
+        json.dump(rows, f, indent=2, default=str)
+    print(f"\nSaved ablation results to: {out_file}")
+    print_table(rows)
+    return rows
+
+
+# ---------------------------------------------------------------------- #
+def _parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--data-root',  type=str, required=True,
+                   help='Path to the dataset root.')
+    p.add_argument('--val-root',   type=str, default=None,
+                   help='Optional separate validation root.')
+    p.add_argument('--output-dir', type=str, default='./runs/ablation',
+                   help='Directory for all run subfolders and results.')
+    p.add_argument('--epochs',     type=int, default=DEFAULT_CONFIG['epochs'])
+    p.add_argument('--batch-size', type=int,
+                   default=DEFAULT_CONFIG['batch_size'])
+    p.add_argument('--lr',         type=float, default=DEFAULT_CONFIG['lr'])
+    p.add_argument('--num-workers',type=int,
+                   default=DEFAULT_CONFIG['num_workers'])
+    p.add_argument('--quick',      action='store_true',
+                   help='Smoke test: 1 epoch per config.')
+    return p.parse_args()
+
+
+def main():
+    args = _parse_args()
+
+    base_cfg = dict(DEFAULT_CONFIG)
+    base_cfg['data_root']   = args.data_root
+    base_cfg['val_root']    = args.val_root
+    base_cfg['epochs']      = 1 if args.quick else args.epochs
+    base_cfg['batch_size']  = args.batch_size
+    base_cfg['lr']          = args.lr
+    base_cfg['num_workers'] = args.num_workers
+
+    run_ablation(base_cfg, ABLATION_CONFIGS, args.output_dir)
+
+
+if __name__ == '__main__':
+    main()
