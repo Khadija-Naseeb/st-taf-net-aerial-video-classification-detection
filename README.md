@@ -1,6 +1,10 @@
 # ST-TAF Net — Spatio-Temporal Transformer-based Anchor-Free Network
 ### Aerial Video Classification & Object Detection | MOD20 Dataset
 
+## Authors
+
+- Khadija Naseeb - 25011017
+- Fatema Ebrahim - 25010868
 ---
 
 ## Overview
