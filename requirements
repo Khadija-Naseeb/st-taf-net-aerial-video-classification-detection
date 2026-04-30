@@ -1,0 +1,9 @@
+# Core dependencies (used by the code)
+torch
+numpy
+opencv-python
+decord       # optional: code falls back to OpenCV if unavailable
+
+# Optional extras
+torchvision  # standard companion to torch; not imported but commonly expected
+matplotlib   # for regenerating Figure 3 (heatmap) and Figure 4 (training curve)
