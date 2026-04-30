@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ==============================
+# Project-specific ignores
+# ==============================
+
+# Ignore dataset (VERY IMPORTANT)
+MOD20/
+data/
+
+# Ignore trained models
+*.pth
+
+# Ignore system files (Mac)
+.DS_Store
