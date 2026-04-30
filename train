@@ -1,0 +1,314 @@
+"""
+Training entry point for ST-TAF Net.
+
+Two ways to use this file:
+
+  1) Run as a script with the defaults at the bottom:
+        python train.py
+
+  2) Import train_model() with a custom config (used by run_ablation.py):
+        from train import train_model
+        train_model(config)
+"""
+
+import os
+import json
+import argparse
+import torch
+from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+from st_taf_net import ST_TAF_Net
+from loss        import JointLoss
+from mod20_dataset import MOD20Dataset
+from eval        import evaluate
+
+
+# ===========================================================
+#  DEFAULT CONFIGURATION
+# ===========================================================
+DEFAULT_CONFIG = {
+    # Data
+    'data_root'        : 'D:/MOD20',   # <-- CHANGE
+    'val_root'         : None,         # if None, falls back to data_root
+    'batch_size'       : 4,
+    'num_frames'       : 8,
+    'spatial_size'     : (256, 256),
+    'event_classes'    : 20,
+    'det_classes'      : 10,
+    'num_workers'      : 4,
+    'downsample_ratio' : 8,
+
+    # Augmentation
+    'augment'          : True,
+    'crop_scale'       : 0.8,
+    'flip_prob'        : 0.5,
+    'blur_prob'        : 0.5,
+    'temporal_jitter'  : 2,
+
+    # Optimisation
+    'epochs'           : 40,
+    'lr'               : 3e-4,
+    'weight_decay'     : 1e-4,
+
+    # Architecture / loss flags
+    'use_se'           : True,
+    'use_offset'       : True,
+    'task_mode'        : 'joint',     # joint | cls_only | det_only
+    'adaptive_weights' : True,        # set False for the "fixed weights" row
+
+    # Loss scalar weights (used when adaptive_weights=False)
+    'lambda_cls'       : 1.0,
+    'lambda_det'       : 1.0,
+    'lambda_hm'        : 1.0,
+    'lambda_off'       : 1.0,
+    'lambda_size'      : 0.1,
+
+    # Logging / checkpoint
+    'run_name'         : 'sttaf_full',
+    'output_dir'       : './runs',
+    'eval_every'       : 1,
+    'verbose'          : True,
+}
+
+
+# ----------------------------------------------------------------- #
+def _make_loaders(cfg):
+    train_set = MOD20Dataset(
+        data_root        = cfg['data_root'],
+        split            = 'train',
+        num_frames       = cfg['num_frames'],
+        spatial_size     = cfg['spatial_size'],
+        augment          = cfg['augment'],
+        crop_scale       = cfg['crop_scale'],
+        flip_prob        = cfg['flip_prob'],
+        blur_prob        = cfg['blur_prob'],
+        temporal_jitter  = cfg['temporal_jitter'],
+        downsample_ratio = cfg['downsample_ratio'],
+        det_classes      = cfg['det_classes'],
+    )
+
+    val_root = cfg.get('val_root') or cfg['data_root']
+    val_set = MOD20Dataset(
+        data_root        = val_root,
+        split            = 'val',
+        num_frames       = cfg['num_frames'],
+        spatial_size     = cfg['spatial_size'],
+        augment          = False,
+        downsample_ratio = cfg['downsample_ratio'],
+        det_classes      = cfg['det_classes'],
+    )
+
+    pin = torch.cuda.is_available()
+    train_loader = DataLoader(train_set,
+                              batch_size  = cfg['batch_size'],
+                              shuffle     = True,
+                              num_workers = cfg['num_workers'],
+                              pin_memory  = pin)
+    val_loader   = DataLoader(val_set,
+                              batch_size  = cfg['batch_size'],
+                              shuffle     = False,
+                              num_workers = cfg['num_workers'],
+                              pin_memory  = pin)
+    return train_loader, val_loader
+
+
+# ----------------------------------------------------------------- #
+def train_one_epoch(model, loader, optim_, criterion, scaler, device,
+                    epoch, cfg):
+    model.train()
+    total = 0.0
+    use_amp = (device.type == 'cuda')
+
+    for i, batch in enumerate(loader):
+        x, cls_t, hm_t, off_t, sz_t, mask = [v.to(device) for v in batch]
+
+        optim_.zero_grad()
+        with autocast(enabled=use_amp):
+            out = model(x)
+            preds_cls = out.get('event_cls')
+            heatmap   = out.get('heatmap')
+            offset    = out.get('offset')
+            size      = out.get('size')
+
+            loss, l_cls, l_det, l_hm, l_off, l_size = criterion(
+                preds_cls, heatmap, offset, size,
+                cls_t, hm_t, off_t, sz_t, mask)
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.step(optim_)
+            scaler.update()
+        else:
+            loss.backward()
+            optim_.step()
+
+        total += loss.item()
+        if cfg['verbose'] and i % 5 == 0:
+            print(f"  Epoch [{epoch:02d}] | Batch [{i}/{len(loader)}] | "
+                  f"Loss: {loss.item():.4f} | "
+                  f"Cls: {l_cls.item():.4f} | "
+                  f"Det: {l_det.item():.4f}")
+
+    return total / max(len(loader), 1)
+
+
+# ----------------------------------------------------------------- #
+def _score_for_selection(metrics, task_mode):
+    """Pick the right validation scalar for 'best model' selection."""
+    if task_mode == 'cls_only':
+        return metrics.get('cls_acc') or 0.0
+    if task_mode == 'det_only':
+        return metrics.get('mAP') or 0.0
+    # joint: weighted combo - 50/50
+    a = metrics.get('cls_acc') or 0.0
+    m = metrics.get('mAP')     or 0.0
+    return 0.5 * a + 0.5 * m
+
+
+def train_model(cfg):
+    """Main training routine. Returns the best validation metrics dict."""
+    cfg = dict(DEFAULT_CONFIG, **cfg)
+    os.makedirs(cfg['output_dir'], exist_ok=True)
+    run_dir = os.path.join(cfg['output_dir'], cfg['run_name'])
+    os.makedirs(run_dir, exist_ok=True)
+
+    if cfg['verbose']:
+        print('=' * 60)
+        print(f"  Run: {cfg['run_name']}")
+        print('=' * 60)
+        print(json.dumps({k: str(v) for k, v in cfg.items()}, indent=2))
+
+    if not os.path.exists(cfg['data_root']):
+        print(f"\n[ERROR] Dataset folder not found: '{cfg['data_root']}'")
+        return None
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if cfg['verbose']:
+        print(f"Using device: {device}")
+        if device.type == 'cuda':
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    train_loader, val_loader = _make_loaders(cfg)
+    if len(train_loader.dataset) == 0:
+        print('[ERROR] No videos found.')
+        return None
+
+    model = ST_TAF_Net(
+        in_channels       = 3,
+        event_classes     = cfg['event_classes'],
+        detection_classes = cfg['det_classes'],
+        use_se            = cfg['use_se'],
+        use_offset        = cfg['use_offset'],
+        task_mode         = cfg['task_mode'],
+    ).to(device)
+
+    if cfg['verbose']:
+        n_params = sum(p.numel() for p in model.parameters())
+        print(f"Model parameters: {n_params:,}")
+
+    criterion = JointLoss(
+        lambda_cls       = cfg['lambda_cls'],
+        lambda_det       = cfg['lambda_det'],
+        lambda_hm        = cfg['lambda_hm'],
+        lambda_off       = cfg['lambda_off'],
+        lambda_size      = cfg['lambda_size'],
+        task_mode        = cfg['task_mode'],
+        use_offset       = cfg['use_offset'],
+        adaptive_weights = cfg['adaptive_weights'],
+    ).to(device)
+
+    optim_    = optim.AdamW(
+        list(model.parameters()) + list(criterion.parameters()),
+        lr=cfg['lr'], weight_decay=cfg['weight_decay'])
+    scheduler = CosineAnnealingLR(optim_, T_max=cfg['epochs'])
+    scaler    = GradScaler(enabled=(device.type == 'cuda'))
+
+    best_score   = -float('inf')
+    best_metrics = {}
+
+    for epoch in range(1, cfg['epochs'] + 1):
+        if cfg['verbose']:
+            print(f"\n--- Epoch {epoch}/{cfg['epochs']} ---")
+        avg = train_one_epoch(model, train_loader, optim_, criterion,
+                              scaler, device, epoch, cfg)
+        scheduler.step()
+        if cfg['verbose']:
+            print(f"  >> Epoch {epoch} avg train loss: {avg:.4f}")
+
+        if epoch % cfg['eval_every'] == 0:
+            metrics = evaluate(model, val_loader, device,
+                               num_event_classes=cfg['event_classes'],
+                               num_det_classes=cfg['det_classes'],
+                               downsample_ratio=cfg['downsample_ratio'])
+            if cfg['verbose']:
+                print(f"  >> Val: cls_acc={metrics.get('cls_acc')} "
+                      f"mAP={metrics.get('mAP')} "
+                      f"fps={metrics.get('fps'):.2f}")
+            score = _score_for_selection(metrics, cfg['task_mode'])
+            if score > best_score:
+                best_score   = score
+                best_metrics = metrics
+                ckpt_path = os.path.join(run_dir, 'best_model.pth')
+                torch.save({'model': model.state_dict(),
+                            'config': cfg,
+                            'metrics': metrics}, ckpt_path)
+                if cfg['verbose']:
+                    print(f"  >> Saved best model -> {ckpt_path}")
+
+    # Persist final summary
+    summary = {
+        'config': {k: str(v) for k, v in cfg.items()},
+        'best_metrics': {
+            'cls_acc'       : best_metrics.get('cls_acc'),
+            'mAP'           : best_metrics.get('mAP'),
+            'fps'           : best_metrics.get('fps'),
+            'per_class_acc' : best_metrics.get('per_class_acc'),
+            'per_class_AP'  : best_metrics.get('per_class_AP'),
+        },
+    }
+    with open(os.path.join(run_dir, 'summary.json'), 'w') as f:
+        json.dump(summary, f, indent=2, default=str)
+
+    return best_metrics
+
+
+# ----------------------------------------------------------------- #
+def _parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--data-root',  type=str,
+                   default=DEFAULT_CONFIG['data_root'])
+    p.add_argument('--epochs',     type=int,
+                   default=DEFAULT_CONFIG['epochs'])
+    p.add_argument('--batch-size', type=int,
+                   default=DEFAULT_CONFIG['batch_size'])
+    p.add_argument('--lr',         type=float,
+                   default=DEFAULT_CONFIG['lr'])
+    p.add_argument('--use-se',     dest='use_se',
+                   action='store_true', default=DEFAULT_CONFIG['use_se'])
+    p.add_argument('--no-se',      dest='use_se', action='store_false')
+    p.add_argument('--use-offset', dest='use_offset',
+                   action='store_true', default=DEFAULT_CONFIG['use_offset'])
+    p.add_argument('--no-offset',  dest='use_offset', action='store_false')
+    p.add_argument('--task-mode',  type=str,
+                   default=DEFAULT_CONFIG['task_mode'],
+                   choices=['joint', 'cls_only', 'det_only'])
+    p.add_argument('--fixed-weights', dest='adaptive_weights',
+                   action='store_false',
+                   default=DEFAULT_CONFIG['adaptive_weights'])
+    p.add_argument('--run-name',   type=str,
+                   default=DEFAULT_CONFIG['run_name'])
+    return p.parse_args()
+
+
+def main():
+    args = _parse_args()
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(vars(args))
+    train_model(cfg)
+
+
+if __name__ == '__main__':
+    main()
