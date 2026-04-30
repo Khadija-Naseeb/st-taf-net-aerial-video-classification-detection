@@ -1,0 +1,163 @@
+"""
+Joint multi-task loss for ST-TAF Net, with ablation flags.
+
+  L = lambda_cls * L_cls + lambda_det * L_det
+  L_det = lambda_hm * L_hm + lambda_off * L_off + lambda_size * L_size
+
+New flags:
+  * task_mode        : 'joint' | 'cls_only' | 'det_only'
+                       Skips the irrelevant terms.
+  * use_offset       : when False, the offset L1 term is skipped.
+  * adaptive_weights : when True, replaces the FIXED scalar lambdas
+                       with learnable uncertainty-weighting (Kendall,
+                       Gal & Cipolla, 2018):
+                          L = sum_i exp(-s_i) * L_i + s_i
+                       where s_i = log(sigma_i^2) is a free parameter
+                       per task. This gives a meaningful contrast for
+                       the "fixed loss weights" ablation row.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------- #
+def focal_loss(pred, target, alpha=2, beta=4):
+    """Penalty-reduced focal loss for heatmap prediction (CenterNet)."""
+    pos_inds    = target.eq(1).float()
+    neg_inds    = target.lt(1).float()
+    neg_weights = torch.pow(1 - target, beta)
+
+    pred = torch.clamp(pred, 1e-4, 1 - 1e-4)
+
+    pos_loss = torch.log(pred) * torch.pow(1 - pred, alpha) * pos_inds
+    neg_loss = (torch.log(1 - pred) * torch.pow(pred, alpha)
+                * neg_weights * neg_inds)
+
+    num_pos  = pos_inds.float().sum()
+    pos_loss = pos_loss.sum()
+    neg_loss = neg_loss.sum()
+
+    if num_pos == 0:
+        return -neg_loss
+    return -(pos_loss + neg_loss) / num_pos
+
+
+# ---------------------------------------------------------------------- #
+class JointLoss(nn.Module):
+    VALID_TASK_MODES = ('joint', 'cls_only', 'det_only')
+
+    def __init__(self,
+                 lambda_cls=1.0,
+                 lambda_det=1.0,
+                 lambda_hm=1.0,
+                 lambda_off=1.0,
+                 lambda_size=0.1,
+                 task_mode='joint',
+                 use_offset=True,
+                 adaptive_weights=False):
+        super().__init__()
+        if task_mode not in self.VALID_TASK_MODES:
+            raise ValueError(
+                f"task_mode must be one of {self.VALID_TASK_MODES}")
+
+        self.lambda_cls       = lambda_cls
+        self.lambda_det       = lambda_det
+        self.lambda_hm        = lambda_hm
+        self.lambda_off       = lambda_off
+        self.lambda_size      = lambda_size
+        self.task_mode        = task_mode
+        self.use_offset       = use_offset
+        self.adaptive_weights = adaptive_weights
+
+        self.cls_criterion = nn.CrossEntropyLoss()
+
+        # Learnable log-variances for uncertainty weighting.
+        # Only the active tasks get a parameter, but to keep the
+        # state_dict stable across configurations we always allocate
+        # all four and just don't reference the unused ones.
+        if adaptive_weights:
+            self.log_var_cls = nn.Parameter(torch.zeros(()))
+            self.log_var_det = nn.Parameter(torch.zeros(()))
+        else:
+            self.register_buffer('log_var_cls', torch.zeros(()))
+            self.register_buffer('log_var_det', torch.zeros(()))
+
+    # ------------------------------------------------------------------ #
+    def _weighted_sum(self, terms):
+        """
+        terms: dict {'cls': L_cls, 'det': L_det} (only active keys).
+        Returns the combined scalar.
+        """
+        if not self.adaptive_weights:
+            total = 0.0
+            if 'cls' in terms:
+                total = total + self.lambda_cls * terms['cls']
+            if 'det' in terms:
+                total = total + self.lambda_det * terms['det']
+            return total
+
+        total = 0.0
+        if 'cls' in terms:
+            total = total + torch.exp(-self.log_var_cls) * terms['cls'] \
+                          + self.log_var_cls
+        if 'det' in terms:
+            total = total + torch.exp(-self.log_var_det) * terms['det'] \
+                          + self.log_var_det
+        return total
+
+    # ------------------------------------------------------------------ #
+    def forward(self,
+                preds_cls, heatmaps, offsets, sizes,
+                target_cls, target_heatmaps, target_offsets, target_sizes,
+                mask):
+        """
+        Any of the prediction tensors can be None when the
+        corresponding task is disabled.
+        """
+        device = (preds_cls.device if preds_cls is not None
+                  else heatmaps.device)
+        zero = torch.zeros((), device=device)
+
+        l_cls  = zero
+        l_det  = zero
+        l_hm   = zero
+        l_off  = zero
+        l_size = zero
+
+        # ---- classification ----
+        if self.task_mode in ('joint', 'cls_only') and preds_cls is not None:
+            l_cls = self.cls_criterion(preds_cls, target_cls)
+
+        # ---- detection ----
+        if self.task_mode in ('joint', 'det_only') and heatmaps is not None:
+            l_hm = focal_loss(heatmaps, target_heatmaps)
+
+            num_objects = mask.sum().clamp(min=1.0)
+            mask_expanded = mask.unsqueeze(1).expand_as(sizes)
+
+            l_size = F.l1_loss(sizes * mask_expanded,
+                               target_sizes * mask_expanded,
+                               reduction='sum') / num_objects
+
+            if self.use_offset and offsets is not None:
+                l_off = F.l1_loss(offsets * mask_expanded,
+                                  target_offsets * mask_expanded,
+                                  reduction='sum') / num_objects
+            else:
+                l_off = zero
+
+            l_det = (self.lambda_hm   * l_hm
+                     + self.lambda_off  * l_off
+                     + self.lambda_size * l_size)
+
+        # ---- combine ----
+        terms = {}
+        if self.task_mode in ('joint', 'cls_only'):
+            terms['cls'] = l_cls
+        if self.task_mode in ('joint', 'det_only'):
+            terms['det'] = l_det
+        total = self._weighted_sum(terms)
+
+        return total, l_cls, l_det, l_hm, l_off, l_size
