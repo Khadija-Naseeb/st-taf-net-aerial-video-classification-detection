@@ -1,6 +1,7 @@
 # ST-TAF Net — Spatio-Temporal Transformer-based Anchor-Free Network
 ### Aerial Video Classification & Object Detection | MOD20 Dataset
 
+---
 ## Authors
 
 - Khadija Naseeb - 25011017
@@ -25,14 +26,15 @@ ST-TAF Net is a unified deep learning framework for aerial video analytics that 
 ## File Structure
 
 ```
-st-taf-net/
-├── st_taf_net.py      # Neural network model (WSE-AVT Backbone + Anchor-Free Head)
-├── loss.py            # Joint multi-task loss (Focal Loss + Cross Entropy + L1)
-├── mod20_dataset.py   # Video dataset loader (uses decord for fast loading) 
-├── train.py           # Main training script — EDIT DATA_ROOT HERE
-├── test_forward.py    # Architecture sanity check (no dataset needed)
-├── requirements.txt   # Python dependencies
-├── README.md          # This file
+├── st_taf_net.py        # Model with ablation flags (use_se, use_offset, task_mode)
+├── loss.py              # Joint loss + uncertainty (adaptive) weighting option
+├── mod20_dataset.py     # Dataset loader: full augmentations + bbox supervision
+├── eval.py              # Evaluator: top-1 acc, mAP@0.5, FPS
+├── train.py             # Training loop. Importable train_model(cfg)
+├── run_ablation.py      # Runs all 6 rows of Table 2 in the paper
+├── test_forward.py      # Architecture sanity check (no dataset needed)
+├── requirements.txt     # Python dependencies
+└── README.md            # This file
 └── assets/
 ```
 
@@ -43,7 +45,7 @@ st-taf-net/
 If you don't have Python installed:
 1. Go to: **https://www.python.org/downloads/**
 2. Download **Python 3.10** or newer
-3. During installation, check **"Add Python to PATH"** 
+3. During installation, check **"Add Python to PATH"**
 
 Verify installation:
 ```powershell
@@ -54,8 +56,6 @@ python --version
 
 ## Step 2: Install Dependencies
 
-Open **PowerShell** or **Command Prompt** and run:
-
 ```powershell
 cd "C:\Users\My-PC\Downloads\ST"
 pip install -r requirements.txt
@@ -63,24 +63,19 @@ pip install -r requirements.txt
 
 This installs: `torch`, `torchvision`, `opencv-python`, `decord`, `numpy`, `matplotlib`, `scikit-learn`
 
-> **Note on `decord`**: If decord fails to install on Windows, the code will automatically fall back to OpenCV for video loading. This is fine.
+> **Note on `decord`**: If decord fails to install on Windows, the code falls back to OpenCV automatically.
 
 ---
 
-## Step 3: Download the MOD20 Dataset
+## Step 3: Download the Dataset
 
 MOD20 is a **Multi-view Outdoor Dataset** containing 2,324 aerial video clips across 20 action categories, collected via drone cameras.
 
-### How to obtain the dataset:
-
-**Option A — Contact the Authors (Official Channel)**
-The dataset is maintained by researchers and requires an access request:
+### Option A — Contact the Authors (Official Channel)
 - Paper: *"Multi-view Action Recognition using Cross-view Video Prediction"*
-- Search for it on: **https://arxiv.org/search/?searchtype=all&query=MOD20+aerial+action**
-- Email the corresponding author requesting dataset access (typically listed in the paper's "Data Availability" section)
+- Search: **https://arxiv.org/search/?searchtype=all&query=MOD20+aerial+action**
 
-**Option B — Use a Compatible Public Dataset (Recommended for Testing)**
-If you do not have direct MOD20 access, these publicly available aerial datasets work with the same code:
+### Option B — Use a Compatible Public Dataset (Recommended for Testing)
 
 | Dataset | Link | Classes | Task |
 |---|---|---|---|
@@ -88,13 +83,13 @@ If you do not have direct MOD20 access, these publicly available aerial datasets
 | **ERA Dataset** | https://lcmou.github.io/ERA_Dataset/ | 25 | Aerial Event Recognition |
 | **VisDrone-VID** | https://github.com/VisDrone/VisDrone-Dataset | 10 | Object Detection |
 
-> ⭐ **ERA (Event Recognition in Aerial videos)** is the closest publicly available substitute — same aerial video structure, 25 event classes, and freely downloadable.
+> ⭐ **ERA** is the closest publicly available substitute. For **VisDrone-VID** you get bounding-box annotations out of the box — useful if you want non-trivial detection metrics.
 
 ---
 
 ## Step 4: Organize Your Videos
 
-The code expects your video files to be arranged in **one folder per class**:
+Folder structure (one folder per class):
 
 ```
 MOD20/
@@ -105,72 +100,132 @@ MOD20/
         video010.mp4
     fire/
         video020.mp4
-    ... (one subfolder per class)
+    annotations.json    # OPTIONAL — see below
 ```
 
-> The folder names automatically become the class labels. No extra annotation files are needed for classification.
+The folder names automatically become the class labels.
+
+### Optional: Bounding-Box Annotations
+
+For real detection metrics (mAP@0.5), drop an `annotations.json` at the dataset root:
+
+```json
+{
+  "ambulance/video001.mp4": [
+    [0, 120, 240, 80, 60],
+    [3, 510, 305, 45, 90]
+  ],
+  "fire/video020.mp4": [
+    [5, 50, 50, 200, 200]
+  ]
+}
+```
+
+Each entry is `[class_id, x, y, w, h]` in **absolute pixel coordinates of the original frame**. Boxes are treated as constant across the clip's frames (a reasonable simplification for short aerial action clips). Videos missing from the file simply contribute zero detection supervision and do not break training.
+
+If you skip this file, the classification head still trains correctly; the detection metrics will report zero/near-zero mAP because there are no targets.
 
 ---
 
-## Step 5: Configure and Run Training
-
-### 5.1 — Open `train.py` and edit Line 13:
-
-```python
-# CHANGE THIS to your actual dataset folder path:
-DATA_ROOT = "C:/Users/YourName/Downloads/MOD20"
-```
-
-### 5.2 — Run Training:
-
-```powershell
-python train.py
-```
-
-### Expected Output:
-```
-======================================================
-  ST-TAF Net — Real Dataset Training
-======================================================
-Using device: cuda
-GPU: NVIDIA GeForce RTX 3090
-
-Loading MOD20 dataset...
-Found 20 classes: ['ambulance', 'car_crash', 'crowd', ...]
-[train] Loaded 1860 videos across 20 classes.
-
-Model initialized — Parameters: 4,521,482
-
---- Epoch 1/40 ---
-  Epoch [01] | Batch [0/465] | Loss: 92.14 | Cls: 3.04 | Det: 89.10
-  Epoch [01] | Batch [5/465] | Loss: 84.23 | Cls: 2.98 | Det: 81.25
-  ...
-  >> Epoch 1 Average Training Loss: 76.42
-  >> Best model saved! (loss=76.42)
-```
-
-> The loss will **decrease** over 40 epochs. By epoch 40, classification accuracy should approach **82%+** if using the full MOD20 dataset.
-
----
-
-## Step 6: Quick Architecture Test (No Dataset Needed)
-
-To verify the code works before downloading any data:
+## Step 5: Quick Architecture Test (No Dataset Needed)
 
 ```powershell
 python test_forward.py
 ```
 
-Expected output (completes in ~2 seconds on CPU):
+Expected output (~3 seconds on CPU):
+
 ```
-Initializing ST-TAF Net...
-Forward Pass Completed!
-  Event Cls Prediction: torch.Size([2, 20])
-  Heatmap Prediction:   torch.Size([2, 10, 8, 8])
-Total Combined Loss: 118.74
-Backward Pass Completed!
-Time taken: 1.14 seconds.
+============================================================
+  Full ST-TAF Net forward + backward sanity check
+============================================================
+Input video tensor : (2, 3, 4, 64, 64)
+Target heatmap     : (2, 10, 8, 8)
+...
+Forward pass completed. Output keys & shapes:
+  event_cls    : (2, 20)
+  heatmap      : (2, 10, 8, 8)
+  offset       : (2, 2, 8, 8)
+  size         : (2, 2, 8, 8)
+
+Backward pass completed.
+  Total loss        : ...
+
+============================================================
+  Ablation flag sanity check
+============================================================
+  full            loss=...   keys=['event_cls', 'heatmap', 'offset', 'size']
+  no_se           loss=...   keys=['event_cls', 'heatmap', 'offset', 'size']
+  cls_only        loss=...   keys=['event_cls']
+  det_only        loss=...   keys=['heatmap', 'offset', 'size']
+  no_offset       loss=...   keys=['event_cls', 'heatmap', 'offset', 'size']
+  fixed_weights   loss=...   keys=['event_cls', 'heatmap', 'offset', 'size']
+
+All configurations passed.
 ```
+
+---
+
+## Step 6: Train the Full Model
+
+Edit the `DATA_ROOT` variable in `train.py` (top of `DEFAULT_CONFIG`), or pass `--data-root` on the CLI:
+
+```powershell
+python train.py --data-root "C:/Users/YourName/Downloads/MOD20"
+```
+
+The best model (chosen by validation metric, not training loss) is saved at `runs/sttaf_full/best_model.pth` along with `summary.json`.
+
+### Available CLI flags
+
+| Flag | Purpose |
+|---|---|
+| `--data-root PATH` | Dataset root |
+| `--epochs N` | Training epochs (default 40) |
+| `--batch-size N` | Batch size (default 4) |
+| `--lr X` | Learning rate (default 3e-4) |
+| `--no-se` | Disable the Temporal SE module |
+| `--no-offset` | Disable the offset branch |
+| `--task-mode {joint,cls_only,det_only}` | Pick which heads to train |
+| `--fixed-weights` | Use fixed loss weights instead of learnable uncertainty weighting |
+| `--run-name STR` | Subfolder under `runs/` for checkpoints |
+
+---
+
+## Step 7: Run the Full Ablation Study (Table 2)
+
+```powershell
+python run_ablation.py --data-root "C:/Users/YourName/Downloads/MOD20" --epochs 40
+```
+
+This trains six models in sequence:
+
+1. **Full ST-TAF Net** — all components on, adaptive loss weighting.
+2. **Without SE module** — `use_se=False`.
+3. **Without joint training (cls only)** — `task_mode='cls_only'`.
+4. **Without joint training (det only)** — `task_mode='det_only'`.
+5. **Without offset branch** — `use_offset=False`.
+6. **Fixed loss weights (λ₁=λ₂=1)** — `adaptive_weights=False`.
+
+Each row's checkpoint and `summary.json` are saved under `runs/ablation/<run_name>/`. A combined `runs/ablation/ablation_results.json` is written, and a formatted table is printed at the end.
+
+For a **smoke test** (1 epoch per config) before committing to the full study:
+
+```powershell
+python run_ablation.py --data-root /path/to/dataset --quick
+```
+
+---
+
+## Notes on the New Ablation Mechanics
+
+A subtle but important point: the "Fixed loss weights" ablation row only makes sense if the *baseline* uses something different. The codebase therefore defaults to **learnable uncertainty weighting** (Kendall, Gal & Cipolla, 2018):
+
+$$L = \exp(-s_{cls}) \cdot L_{cls} + s_{cls} + \exp(-s_{det}) \cdot L_{det} + s_{det}$$
+
+where `s_cls` and `s_det` are free scalar parameters. The "Fixed loss weights" row turns this off and reverts to plain `λ₁·L_cls + λ₂·L_det`. Inside `L_det`, the `λ_size = 0.1` weighting from the paper still applies in both modes — only the cls/det balance changes.
+
+If you want to keep the paper's loss formula literally as written, pass `--fixed-weights` for the main run *and* drop row 6 from the ablation (since it would then be identical to row 1).
 
 ---
 
@@ -184,21 +239,6 @@ Time taken: 1.14 seconds.
 | **Python** | 3.8+ | 3.10 |
 | **CUDA** | Not required | 11.8+ for GPU acceleration |
 
-> **Without a GPU**: Training will work but will be very slow (~10x slower). `test_forward.py` still runs fine in a few seconds.
-
----
-
-## Reproducing the Published Results
-
-To reproduce **82.4% Accuracy / 34.2 mAP / 22 FPS**, you need:
-
-1.  Full MOD20 dataset (all 2,324 clips / 20 classes)
-2.  Train for the full **40 epochs**
-3.  NVIDIA GPU (RTX series recommended)
-4.  Run `train.py` with all default settings
-
-The best model will be saved automatically as **`best_model.pth`** in your project folder.
-
 ---
 
 ## Troubleshooting
@@ -206,25 +246,20 @@ The best model will be saved automatically as **`best_model.pth`** in your proje
 | Problem | Solution |
 |---|---|
 | `ModuleNotFoundError: torch` | Run `pip install torch torchvision` |
-| `decord` install fails | Install with `pip install decord` or ignore (OpenCV fallback activates) |
-| `No videos found` error | Check your `DATA_ROOT` path and folder structure (see Step 4) |
-| `CUDA out of memory` | Reduce `BATCH_SIZE` in `train.py` from 4 to 2 |
-| `num_workers` error on Windows | Set `NUM_WORKERS = 0` in `train.py` |
-| Training is very slow | No GPU detected — add a CUDA GPU or use Google Colab (free GPU) |
+| `decord` install fails | `pip install decord` or ignore (OpenCV fallback activates) |
+| `No videos found` error | Check `--data-root` path and folder structure (see Step 4) |
+| `CUDA out of memory` | Reduce `--batch-size` from 4 to 2 |
+| `num_workers` error on Windows | Set `num_workers=0` in `DEFAULT_CONFIG` |
+| mAP is always 0.0 | You probably haven't supplied an `annotations.json` (see Step 4) |
+| Training is very slow | No GPU detected — use Google Colab (free GPU) |
 
 ---
 
-## Running on Google Colab (Free GPU Alternative)
+## Running on Google Colab
 
-If you don't have a GPU on your PC, you can run this for free on Google Colab:
-
-1. Go to: **https://colab.research.google.com/**
-2. Upload all `.py` files
-3. Upload your dataset to Google Drive and mount it
-4. Run:
 ```python
 !pip install torch torchvision decord opencv-python
-!python train.py
+!python run_ablation.py --data-root /content/drive/MyDrive/MOD20 --epochs 40
 ```
 
 ---
@@ -233,5 +268,7 @@ If you don't have a GPU on your PC, you can run this for free on Google Colab:
 
 1. Yang et al. (2025). *Aerial Video Classification by Integrating Global-Local Semantics in ConvNets.*
 2. FuTH-Net: *Fusing Temporal Relations and Holistic Features for Aerial Video Classification.*
-3. CenterNet: Objects as Points — Original anchor-free detection paper (Zhou et al., 2019).
-4. Swin Transformer: *Hierarchical Vision Transformer using Shifted Windows (Liu et al., 2021).*
+3. Zhou et al. (2019). *Objects as Points* (CenterNet) — anchor-free detection foundation.
+4. Liu et al. (2021). *Swin Transformer: Hierarchical Vision Transformer using Shifted Windows.*
+5. Kendall, Gal & Cipolla (2018). *Multi-Task Learning Using Uncertainty to Weigh Losses* — adaptive loss weighting used by the joint loss when `adaptive_weights=True`.
+
