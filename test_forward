@@ -1,0 +1,145 @@
+"""
+Architecture sanity check for ST-TAF Net.
+
+This script exercises:
+  * The full forward + backward pass with the new dict-style output.
+  * Every combination of ablation flags (use_se, use_offset, task_mode,
+    adaptive_weights) so any shape mismatch surfaces immediately.
+
+It uses small dummy tensors so it finishes in a few seconds on CPU.
+No dataset is required.
+"""
+
+import time
+import torch
+
+from st_taf_net import ST_TAF_Net
+from loss        import JointLoss
+
+
+# ---------------------------------------------------------------------- #
+def _make_dummy_batch(b, t, h_in, w_in, det_classes, event_classes,
+                      downsample=8):
+    h_out = h_in // downsample
+    w_out = w_in // downsample
+
+    x        = torch.randn(b, 3, t, h_in, w_in)
+    cls_t    = torch.randint(0, event_classes, (b,))
+    hm_t     = torch.zeros(b, det_classes, h_out, w_out)
+    off_t    = torch.zeros(b, 2, h_out, w_out)
+    sz_t     = torch.ones(b, 2, h_out, w_out) * 5
+    mask_t   = torch.zeros(b, h_out, w_out)
+
+    # One synthetic object at the centre of every clip
+    cy, cx = h_out // 2, w_out // 2
+    hm_t[:, 0, cy, cx] = 1.0
+    mask_t[:, cy, cx]  = 1.0
+    return x, cls_t, hm_t, off_t, sz_t, mask_t
+
+
+# ---------------------------------------------------------------------- #
+def run_full_pipeline():
+    print("=" * 60)
+    print("  Full ST-TAF Net forward + backward sanity check")
+    print("=" * 60)
+
+    b, t, h_in, w_in   = 2, 4, 64, 64
+    event_classes      = 20
+    det_classes        = 10
+
+    model = ST_TAF_Net(in_channels       = 3,
+                       event_classes     = event_classes,
+                       detection_classes = det_classes,
+                       use_se            = True,
+                       use_offset        = True,
+                       task_mode         = 'joint')
+    criterion = JointLoss(task_mode='joint',
+                          use_offset=True,
+                          adaptive_weights=True)
+
+    x, cls_t, hm_t, off_t, sz_t, mask_t = _make_dummy_batch(
+        b, t, h_in, w_in, det_classes, event_classes)
+
+    print(f"\nInput video tensor : {tuple(x.shape)}")
+    print(f"Target heatmap     : {tuple(hm_t.shape)}")
+    print(f"Target offset      : {tuple(off_t.shape)}")
+    print(f"Target size        : {tuple(sz_t.shape)}\n")
+
+    t0 = time.time()
+    model.train()
+
+    out = model(x)
+    print("Forward pass completed. Output keys & shapes:")
+    for k, v in out.items():
+        print(f"  {k:12s} : {tuple(v.shape)}")
+
+    loss, l_cls, l_det, l_hm, l_off, l_size = criterion(
+        out.get('event_cls'), out.get('heatmap'),
+        out.get('offset'),    out.get('size'),
+        cls_t, hm_t, off_t, sz_t, mask_t)
+
+    loss.backward()
+    print(f"\nBackward pass completed.")
+    print(f"  Total loss        : {loss.item():.4f}")
+    print(f"  Cls (CE)          : {l_cls.item():.4f}")
+    print(f"  Det (combined)    : {l_det.item():.4f}")
+    print(f"    Heatmap (focal) : {l_hm.item():.4f}")
+    print(f"    Offset  (L1)    : {l_off.item():.4f}")
+    print(f"    Size    (L1)    : {l_size.item():.4f}")
+    print(f"\nElapsed: {time.time() - t0:.2f} s")
+
+
+# ---------------------------------------------------------------------- #
+def run_ablation_sanity():
+    """Make sure every ablation configuration runs end-to-end."""
+    print("\n" + "=" * 60)
+    print("  Ablation flag sanity check")
+    print("=" * 60)
+
+    b, t, h_in, w_in = 2, 4, 64, 64
+    event_classes    = 20
+    det_classes      = 10
+
+    configs = [
+        ('full',           dict(use_se=True,  use_offset=True,
+                                task_mode='joint',    adaptive_weights=True)),
+        ('no_se',          dict(use_se=False, use_offset=True,
+                                task_mode='joint',    adaptive_weights=True)),
+        ('cls_only',       dict(use_se=True,  use_offset=True,
+                                task_mode='cls_only', adaptive_weights=False)),
+        ('det_only',       dict(use_se=True,  use_offset=True,
+                                task_mode='det_only', adaptive_weights=False)),
+        ('no_offset',      dict(use_se=True,  use_offset=False,
+                                task_mode='joint',    adaptive_weights=True)),
+        ('fixed_weights',  dict(use_se=True,  use_offset=True,
+                                task_mode='joint',    adaptive_weights=False)),
+    ]
+
+    for name, flags in configs:
+        model = ST_TAF_Net(event_classes     = event_classes,
+                           detection_classes = det_classes,
+                           use_se            = flags['use_se'],
+                           use_offset        = flags['use_offset'],
+                           task_mode         = flags['task_mode'])
+        criterion = JointLoss(task_mode        = flags['task_mode'],
+                              use_offset       = flags['use_offset'],
+                              adaptive_weights = flags['adaptive_weights'])
+
+        x, cls_t, hm_t, off_t, sz_t, mask_t = _make_dummy_batch(
+            b, t, h_in, w_in, det_classes, event_classes)
+
+        out = model(x)
+        loss, *_ = criterion(out.get('event_cls'), out.get('heatmap'),
+                             out.get('offset'),    out.get('size'),
+                             cls_t, hm_t, off_t, sz_t, mask_t)
+        loss.backward()
+        keys = sorted(out.keys())
+        print(f"  {name:14s}  loss={loss.item():8.4f}  keys={keys}")
+
+    print("\nAll configurations passed.")
+
+
+# ---------------------------------------------------------------------- #
+if __name__ == "__main__":
+    run_full_pipeline()
+    run_ablation_sanity()
