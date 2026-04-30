@@ -1,0 +1,231 @@
+"""
+ST-TAF Net with ablation flags.
+
+New flags (all default to the full architecture, so existing callers
+keep working):
+  * use_se      : enable / disable the Temporal Squeeze-and-Excitation
+                  module inside each WSE_AVT_Block.
+  * use_offset  : enable / disable the sub-pixel offset branch in the
+                  detection head. Disabling it means box centers snap
+                  to the heatmap grid.
+  * task_mode   : 'joint' | 'cls_only' | 'det_only'
+                  Controls which heads are built and which outputs are
+                  returned. The training loop uses this to skip the
+                  irrelevant losses.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ====================================================================== #
+class TemporalSEModule(nn.Module):
+    """Temporal Squeeze-and-Excitation: re-weights channels over the clip."""
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool3d(1)
+        hidden = max(channels // reduction, 4)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, hidden, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, t, h, w = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1, 1)
+        return x * y.expand_as(x)
+
+
+# ====================================================================== #
+class WSE_AVT_Block(nn.Module):
+    """
+    Window-based Spatio-Temporal Aerial Video Transformer block.
+    Implementation note: the attention is approximated with a 3x3x3
+    Conv3d (a local windowed receptive field), matching the original
+    ST-TAF Net implementation. The SE module can be toggled.
+    """
+    def __init__(self, in_channels, out_channels, use_se=True):
+        super().__init__()
+        self.use_se     = use_se
+        self.attn_proxy = nn.Conv3d(in_channels, out_channels,
+                                    kernel_size=(3, 3, 3),
+                                    padding=(1, 1, 1))
+        self.norm = nn.LayerNorm(out_channels)
+        self.se   = TemporalSEModule(out_channels) if use_se else nn.Identity()
+        self.same_shape = (in_channels == out_channels)
+
+    def forward(self, x):
+        res = x
+        x = self.attn_proxy(x)
+        x = x.permute(0, 2, 3, 4, 1)   # [B,T,H,W,C]
+        x = self.norm(x)
+        x = x.permute(0, 4, 1, 2, 3)   # [B,C,T,H,W]
+        x = F.relu(x)
+        x = self.se(x)
+        if self.same_shape and res.size() == x.size():
+            x = x + res
+        return x
+
+
+# ====================================================================== #
+class AnchorFreeHead(nn.Module):
+    """
+    Detection head with three branches: heatmap, offset (optional),
+    size. When use_offset=False, the offset branch is dropped and a
+    zero-tensor of the right shape is returned in its place so the
+    rest of the pipeline does not need a separate code path.
+    """
+    def __init__(self, in_channels, num_classes, use_offset=True):
+        super().__init__()
+        self.use_offset = use_offset
+
+        self.conv1 = nn.Conv2d(in_channels, 256, kernel_size=3, padding=1)
+
+        self.heatmap_head = nn.Sequential(
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, num_classes, kernel_size=1),
+        )
+        if use_offset:
+            self.offset_head = nn.Sequential(
+                nn.Conv2d(256, 256, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(256, 2, kernel_size=1),
+            )
+        else:
+            self.offset_head = None
+
+        self.size_head = nn.Sequential(
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 2, kernel_size=1),
+        )
+
+    def forward(self, x):
+        feat    = F.relu(self.conv1(x))
+        heatmap = torch.sigmoid(self.heatmap_head(feat))
+        if self.offset_head is not None:
+            offset = self.offset_head(feat)
+        else:
+            b, _, h, w = heatmap.shape
+            offset = torch.zeros(b, 2, h, w, device=heatmap.device,
+                                 dtype=heatmap.dtype)
+        size = F.relu(self.size_head(feat))
+        return heatmap, offset, size
+
+
+# ====================================================================== #
+class ST_TAF_Net(nn.Module):
+    """
+    Spatio-Temporal Transformer-based Anchor-Free Network.
+
+    Args:
+        in_channels        : input video channels (3 for RGB).
+        event_classes      : number of scene-level classes.
+        detection_classes  : number of detection classes (heatmap channels).
+        use_se             : toggle the Temporal SE module.
+        use_offset         : toggle the sub-pixel offset branch.
+        task_mode          : 'joint' | 'cls_only' | 'det_only'.
+
+    Forward returns a dict with the keys that match the active
+    task_mode. Use forward_tuple(...) to get the legacy 4-tuple
+    output (event_cls, heatmap, offset, size) - missing branches
+    are returned as None.
+    """
+
+    VALID_TASK_MODES = ('joint', 'cls_only', 'det_only')
+
+    def __init__(self,
+                 in_channels=3,
+                 event_classes=20,
+                 detection_classes=10,
+                 use_se=True,
+                 use_offset=True,
+                 task_mode='joint'):
+        super().__init__()
+        if task_mode not in self.VALID_TASK_MODES:
+            raise ValueError(f"task_mode must be one of {self.VALID_TASK_MODES}")
+
+        self.use_se     = use_se
+        self.use_offset = use_offset
+        self.task_mode  = task_mode
+
+        # Shared backbone -- always built so feature shapes are stable
+        self.proj = nn.Conv3d(in_channels, 64,
+                              kernel_size=(3, 7, 7),
+                              stride=(1, 2, 2),
+                              padding=(1, 3, 3))
+        self.block1 = WSE_AVT_Block(64, 128, use_se=use_se)
+        self.pool1  = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
+        self.block2 = WSE_AVT_Block(128, 256, use_se=use_se)
+        self.pool2  = nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(2, 2, 2))
+
+        # Classification head
+        if task_mode in ('joint', 'cls_only'):
+            self.global_pool = nn.AdaptiveAvgPool3d(1)
+            self.cls_head    = nn.Linear(256, event_classes)
+        else:
+            self.global_pool = None
+            self.cls_head    = None
+
+        # Detection head
+        if task_mode in ('joint', 'det_only'):
+            self.det_head = AnchorFreeHead(256, detection_classes,
+                                           use_offset=use_offset)
+        else:
+            self.det_head = None
+
+    # ------------------------------------------------------------------ #
+    def _backbone(self, x):
+        x = F.relu(self.proj(x))
+        x = self.block1(x)
+        x = self.pool1(x)
+        x = self.block2(x)
+        x = self.pool2(x)
+        return x
+
+    def forward(self, x):
+        feat = self._backbone(x)              # [B,256,T',H',W']
+        out  = {}
+
+        if self.cls_head is not None:
+            g = self.global_pool(feat).view(feat.size(0), -1)
+            out['event_cls'] = self.cls_head(g)
+
+        if self.det_head is not None:
+            spatial = torch.mean(feat, dim=2)  # [B,256,H',W']
+            hm, off, sz = self.det_head(spatial)
+            out['heatmap'] = hm
+            out['offset']  = off
+            out['size']    = sz
+
+        return out
+
+    def forward_tuple(self, x):
+        """Legacy 4-tuple interface; missing heads return None."""
+        out = self.forward(x)
+        return (out.get('event_cls'),
+                out.get('heatmap'),
+                out.get('offset'),
+                out.get('size'))
+
+
+# ====================================================================== #
+if __name__ == "__main__":
+    # Quick shape sanity check
+    b, c, t, h, w = 2, 3, 4, 64, 64
+    x = torch.randn(b, c, t, h, w)
+    for mode in ('joint', 'cls_only', 'det_only'):
+        for use_se in (True, False):
+            for use_off in (True, False):
+                m = ST_TAF_Net(event_classes=20, detection_classes=10,
+                               use_se=use_se, use_offset=use_off,
+                               task_mode=mode)
+                out = m(x)
+                tag = f"mode={mode:9s} se={use_se} off={use_off}"
+                shapes = {k: tuple(v.shape) for k, v in out.items()}
+                print(f"{tag}  {shapes}")
