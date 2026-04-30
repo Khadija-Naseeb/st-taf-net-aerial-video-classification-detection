@@ -1,0 +1,272 @@
+"""
+Evaluator for ST-TAF Net.
+
+Reports:
+  * Top-1 classification accuracy (overall and per-class).
+  * mAP@0.5 via the heatmap peak-extraction decoder described in the
+    paper: 3x3 max-pool to find local maxima, top-K by score, decode
+    to (x1,y1,x2,y2) using the offset and size predictions.
+  * Inference FPS on the chosen device.
+
+The mAP implementation is the standard 11-point / all-points
+PASCAL-VOC variant restricted to a single IoU threshold (0.5).
+"""
+
+import time
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------- #
+# Decoder                                                                #
+# ---------------------------------------------------------------------- #
+@torch.no_grad()
+def _nms_maxpool(heatmap, kernel=3):
+    """Keep only local maxima within a kxk neighbourhood."""
+    pad = (kernel - 1) // 2
+    hmax = F.max_pool2d(heatmap, kernel, stride=1, padding=pad)
+    keep = (hmax == heatmap).float()
+    return heatmap * keep
+
+
+@torch.no_grad()
+def decode_heatmap(heatmap, offset, size, top_k=100, score_thresh=0.05,
+                   downsample_ratio=8):
+    """
+    heatmap : [B, C, H, W] (sigmoid)
+    offset  : [B, 2, H, W]
+    size    : [B, 2, H, W]
+    Returns : list (per batch) of np.ndarrays of shape [N, 6]
+              with columns (x1, y1, x2, y2, score, class_id)
+              in INPUT-image pixel coordinates.
+    """
+    B, C, H, W = heatmap.shape
+    hm = _nms_maxpool(heatmap)
+
+    flat = hm.view(B, -1)
+    k    = min(top_k, flat.size(1))
+    scores, idxs = flat.topk(k, dim=1)
+
+    cls_ids = idxs // (H * W)
+    rem     = idxs % (H * W)
+    ys      = (rem // W).float()
+    xs      = (rem %  W).float()
+
+    results = []
+    off = offset
+    sz  = size
+
+    for b in range(B):
+        out = []
+        for n in range(k):
+            sc = scores[b, n].item()
+            if sc < score_thresh:
+                continue
+            cls = int(cls_ids[b, n].item())
+            xi  = int(xs[b, n].item())
+            yi  = int(ys[b, n].item())
+            ox  = off[b, 0, yi, xi].item()
+            oy  = off[b, 1, yi, xi].item()
+            sw  = sz[b, 0, yi, xi].item()
+            sh  = sz[b, 1, yi, xi].item()
+
+            cx = (xi + ox) * downsample_ratio
+            cy = (yi + oy) * downsample_ratio
+            w  = sw * downsample_ratio
+            h  = sh * downsample_ratio
+            x1 = cx - w / 2.0
+            y1 = cy - h / 2.0
+            x2 = cx + w / 2.0
+            y2 = cy + h / 2.0
+            out.append([x1, y1, x2, y2, sc, cls])
+        results.append(np.array(out, dtype=np.float32) if out
+                       else np.zeros((0, 6), dtype=np.float32))
+    return results
+
+
+# ---------------------------------------------------------------------- #
+# Ground-truth recovery from target tensors                              #
+# ---------------------------------------------------------------------- #
+def gts_from_targets(target_hm, target_offset, target_size, mask,
+                     downsample_ratio=8):
+    """Reconstruct GT boxes from the supervision tensors."""
+    B = target_hm.shape[0]
+    gts = []
+    for b in range(B):
+        m = mask[b].cpu().numpy()
+        ys, xs = np.where(m > 0)
+        boxes = []
+        for yi, xi in zip(ys, xs):
+            ox = target_offset[b, 0, yi, xi].item()
+            oy = target_offset[b, 1, yi, xi].item()
+            sw = target_size[b, 0, yi, xi].item()
+            sh = target_size[b, 1, yi, xi].item()
+            cls_chan = target_hm[b, :, yi, xi].argmax().item()
+            cx = (xi + ox) * downsample_ratio
+            cy = (yi + oy) * downsample_ratio
+            w  = sw * downsample_ratio
+            h  = sh * downsample_ratio
+            boxes.append([cx - w / 2, cy - h / 2,
+                          cx + w / 2, cy + h / 2, cls_chan])
+        gts.append(np.array(boxes, dtype=np.float32) if boxes
+                   else np.zeros((0, 5), dtype=np.float32))
+    return gts
+
+
+# ---------------------------------------------------------------------- #
+# IoU and mAP                                                            #
+# ---------------------------------------------------------------------- #
+def _iou_xyxy(a, b):
+    inter_x1 = max(a[0], b[0]); inter_y1 = max(a[1], b[1])
+    inter_x2 = min(a[2], b[2]); inter_y2 = min(a[3], b[3])
+    iw = max(0.0, inter_x2 - inter_x1)
+    ih = max(0.0, inter_y2 - inter_y1)
+    inter = iw * ih
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def compute_map(all_preds, all_gts, num_classes, iou_thr=0.5):
+    """
+    all_preds : list (per image) of np.ndarray [N, 6] (x1,y1,x2,y2,sc,cls)
+    all_gts   : list (per image) of np.ndarray [M, 5] (x1,y1,x2,y2,cls)
+    Returns   : (mAP, dict {cls: AP})
+    """
+    aps = {}
+    for c in range(num_classes):
+        scores, tps, fps = [], [], []
+        n_gt = 0
+        for preds, gts in zip(all_preds, all_gts):
+            cls_preds = preds[preds[:, 5] == c] if preds.size else preds
+            cls_gts   = gts[gts[:, 4] == c] if gts.size else gts
+            n_gt += len(cls_gts)
+
+            order = np.argsort(-cls_preds[:, 4]) if len(cls_preds) else []
+            matched = np.zeros(len(cls_gts), dtype=bool)
+            for i in order:
+                p   = cls_preds[i]
+                ious = [_iou_xyxy(p[:4], g[:4]) for g in cls_gts]
+                if ious and max(ious) >= iou_thr:
+                    j = int(np.argmax(ious))
+                    if not matched[j]:
+                        matched[j] = True
+                        tps.append(1); fps.append(0)
+                    else:
+                        tps.append(0); fps.append(1)
+                else:
+                    tps.append(0); fps.append(1)
+                scores.append(p[4])
+
+        if n_gt == 0 and len(scores) == 0:
+            continue
+        if n_gt == 0:
+            aps[c] = 0.0
+            continue
+
+        order  = np.argsort(-np.array(scores))
+        tps    = np.array(tps)[order]
+        fps    = np.array(fps)[order]
+        tp_cum = np.cumsum(tps)
+        fp_cum = np.cumsum(fps)
+        recall    = tp_cum / max(n_gt, 1)
+        precision = tp_cum / np.maximum(tp_cum + fp_cum, 1)
+
+        # All-points AP
+        mrec  = np.concatenate(([0.0], recall, [1.0]))
+        mpre  = np.concatenate(([0.0], precision, [0.0]))
+        for i in range(len(mpre) - 1, 0, -1):
+            mpre[i - 1] = max(mpre[i - 1], mpre[i])
+        idx = np.where(mrec[1:] != mrec[:-1])[0]
+        ap  = np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
+        aps[c] = float(ap)
+
+    if not aps:
+        return 0.0, {}
+    mAP = float(np.mean(list(aps.values())))
+    return mAP, aps
+
+
+# ---------------------------------------------------------------------- #
+# Top-level evaluation loop                                              #
+# ---------------------------------------------------------------------- #
+@torch.no_grad()
+def evaluate(model, dataloader, device,
+             num_event_classes, num_det_classes,
+             downsample_ratio=8, top_k=100, score_thresh=0.05,
+             measure_fps=True):
+    """
+    Returns a dict with keys:
+        cls_acc        : top-1 accuracy or None
+        per_class_acc  : dict {cls_id: acc} or None
+        mAP            : mAP@0.5 or None
+        per_class_AP   : dict {cls_id: AP} or None
+        fps            : frames-per-second (clip-level) or None
+    Any task disabled in the model contributes None.
+    """
+    model.eval()
+
+    cls_correct = 0
+    cls_total   = 0
+    per_cls_correct = np.zeros(num_event_classes, dtype=np.int64)
+    per_cls_total   = np.zeros(num_event_classes, dtype=np.int64)
+
+    all_preds, all_gts = [], []
+
+    n_clips = 0
+    t0 = time.time()
+
+    for batch in dataloader:
+        x, cls_t, hm_t, off_t, sz_t, mask = [v.to(device) for v in batch]
+        out = model(x)
+        n_clips += x.size(0)
+
+        # Classification
+        if 'event_cls' in out:
+            pred = out['event_cls'].argmax(dim=1)
+            cls_correct += (pred == cls_t).sum().item()
+            cls_total   += cls_t.size(0)
+            for p, g in zip(pred.cpu().numpy(), cls_t.cpu().numpy()):
+                per_cls_total[g] += 1
+                if p == g:
+                    per_cls_correct[g] += 1
+
+        # Detection
+        if 'heatmap' in out:
+            preds_b = decode_heatmap(out['heatmap'], out['offset'],
+                                     out['size'],
+                                     top_k=top_k,
+                                     score_thresh=score_thresh,
+                                     downsample_ratio=downsample_ratio)
+            gts_b = gts_from_targets(hm_t, off_t, sz_t, mask,
+                                     downsample_ratio=downsample_ratio)
+            all_preds.extend(preds_b)
+            all_gts.extend(gts_b)
+
+    elapsed = max(time.time() - t0, 1e-6)
+
+    result = {
+        'cls_acc':       None,
+        'per_class_acc': None,
+        'mAP':           None,
+        'per_class_AP':  None,
+        'fps':           (n_clips / elapsed) if measure_fps else None,
+    }
+
+    if cls_total > 0:
+        result['cls_acc'] = cls_correct / cls_total
+        per_cls = {}
+        for c in range(num_event_classes):
+            if per_cls_total[c] > 0:
+                per_cls[c] = per_cls_correct[c] / per_cls_total[c]
+        result['per_class_acc'] = per_cls
+
+    if all_preds:
+        mAP, per_cls_AP = compute_map(all_preds, all_gts, num_det_classes,
+                                      iou_thr=0.5)
+        result['mAP']          = mAP
+        result['per_class_AP'] = per_cls_AP
+
+    return result
